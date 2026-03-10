@@ -38,37 +38,38 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Detector: C2PA provenance using c2patool (cross‑platform)
+# Detector: C2PA provenance using c2patool (hardcoded path + permissions)
 # ---------------------------
 def check_c2pa(file_path: str) -> dict:
     """
     Uses c2patool (official C2PA tool) to verify provenance.
-    Works on Windows and Linux.
+    Hardcoded to look in the script's directory.
     """
-    # Find c2patool in PATH or current directory
-    c2pa_tool = shutil.which("c2patool")
-    if not c2pa_tool:
-        # On Windows, also try with .exe
-        if os.name == 'nt':
-            c2pa_tool = shutil.which("c2patool.exe")
-    if not c2pa_tool:
-        # Look in current directory as fallback
-        local_path = os.path.join(os.path.dirname(__file__), "c2patool")
-        if os.name == 'nt':
-            local_path += ".exe"
-        if os.path.exists(local_path):
-            c2pa_tool = local_path
-        else:
-            return {"present": False, "details": "c2patool not found - please install it"}
-
-    # Ensure the binary is executable (fix for permission denied on Render)
+    # Absolute path to c2patool in the same folder as this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    c2pa_tool = os.path.join(script_dir, "c2patool")
+    
+    # On Windows, add .exe
+    if os.name == 'nt':
+        c2pa_tool += ".exe"
+    
+    # Check if the binary exists
+    if not os.path.exists(c2pa_tool):
+        logger.error(f"c2patool not found at {c2pa_tool}")
+        return {"present": False, "details": "c2patool binary missing"}
+    
+    # Force executable permissions (works on Linux)
     try:
-        # Only try to chmod on Unix-like systems (not Windows)
         if os.name != 'nt':
-            os.chmod(c2pa_tool, 0o755)  # rwxr-xr-x permissions
+            os.chmod(c2pa_tool, 0o755)  # rwxr-xr-x
+            logger.info(f"Set permissions on {c2pa_tool}")
     except Exception as e:
-        # If we can't set permissions, log it but continue
-        logger.warning(f"Could not set executable permission on {c2pa_tool}: {e}")
+        logger.warning(f"Could not chmod {c2pa_tool}: {e}")
+    
+    # Verify it's executable
+    if not os.access(c2pa_tool, os.X_OK):
+        logger.error(f"c2patool at {c2pa_tool} is not executable")
+        return {"present": False, "details": "c2patool not executable"}
 
     try:
         result = subprocess.run(
