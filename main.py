@@ -1,9 +1,13 @@
 # main.py
 import os
+import subprocess
+import json
 import asyncio
 import tempfile
+import shutil
 from pathlib import Path
 import logging
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,40 +38,60 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Detector: C2PA provenance using pure‑Python c2pa library
+# Detector: C2PA provenance using c2patool (copied to temp dir)
 # ---------------------------
 def check_c2pa(file_path: str) -> dict:
     """
-    Uses the pure-Python c2pa library to verify provenance.
-    No external binary required.
+    Uses c2patool binary copied to a temporary location to avoid permission issues.
     """
+    # Source binary location (where build placed it)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_tool = os.path.join(script_dir, "c2patool")
+    if os.name == 'nt':
+        src_tool += ".exe"
+
+    if not os.path.exists(src_tool):
+        logger.error(f"c2patool not found at {src_tool}")
+        return {"present": False, "details": "c2patool binary missing"}
+
+    # Create a temp directory and copy the binary there
+    temp_dir = tempfile.mkdtemp()
+    dest_tool = os.path.join(temp_dir, "c2patool")
+    if os.name == 'nt':
+        dest_tool += ".exe"
+
     try:
-        from c2pa import Reader
-        
-        # Read the file as bytes
-        with open(file_path, 'rb') as f:
-            data = f.read()
-        
-        # Attempt to read C2PA manifest
-        reader = Reader.from_bytes(data)
-        manifests = reader.get_manifests()
-        
-        if manifests:
-            # At least one manifest found
-            # Return a simplified representation (you can expand this)
-            return {
-                "present": True,
-                "details": "C2PA signature found",
-                "manifest_count": len(manifests)
-            }
-        else:
-            return {"present": False, "details": "No C2PA data"}
-    except ImportError:
-        logger.error("c2pa library not installed")
-        return {"present": False, "details": "c2pa library not installed"}
+        shutil.copy2(src_tool, dest_tool)
+        # Make it executable
+        os.chmod(dest_tool, 0o755)
+        logger.info(f"Copied c2patool to {dest_tool} and set permissions")
+
+        # Run the binary
+        result = subprocess.run(
+            [dest_tool, file_path, '--output', '-'],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout:
+            data = json.loads(result.stdout)
+            active_manifest = data.get('active_manifest')
+            if active_manifest:
+                return {
+                    "present": True,
+                    "details": "C2PA signature found",
+                    "manifest": active_manifest
+                }
+        return {"present": False, "details": "No C2PA data"}
+    except subprocess.TimeoutExpired:
+        return {"present": False, "details": "c2patool timed out"}
+    except json.JSONDecodeError:
+        return {"present": False, "details": "Invalid c2patool output"}
     except Exception as e:
         logger.exception("C2PA check failed")
         return {"present": False, "details": f"Error: {str(e)}"}
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 # ---------------------------
 # Detector: Forensic heuristics with image resizing
