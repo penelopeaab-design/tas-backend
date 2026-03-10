@@ -61,6 +61,15 @@ def check_c2pa(file_path: str) -> dict:
         else:
             return {"present": False, "details": "c2patool not found - please install it"}
 
+    # Ensure the binary is executable (fix for permission denied on Render)
+    try:
+        # Only try to chmod on Unix-like systems (not Windows)
+        if os.name != 'nt':
+            os.chmod(c2pa_tool, 0o755)  # rwxr-xr-x permissions
+    except Exception as e:
+        # If we can't set permissions, log it but continue
+        logger.warning(f"Could not set executable permission on {c2pa_tool}: {e}")
+
     try:
         result = subprocess.run(
             [c2pa_tool, file_path, '--output', '-'],
