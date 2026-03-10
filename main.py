@@ -6,7 +6,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 import logging
-import shutil  # <-- added for cross‑platform tool location
+import shutil
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -85,24 +85,45 @@ def check_c2pa(file_path: str) -> dict:
         return {"present": False, "details": f"Error: {str(e)}"}
 
 # ---------------------------
-# Detector: Forensic heuristics
+# Detector: Forensic heuristics with image resizing
 # ---------------------------
 def forensic_analysis(image_path: str) -> dict:
     try:
-        img = cv2.imread(image_path)
+        # Open image with PIL first to check size and resize if needed
+        pil_img = Image.open(image_path)
+        
+        # Define maximum dimension (e.g., 1024 pixels)
+        max_dim = 1024
+        if max(pil_img.size) > max_dim:
+            # Resize while keeping aspect ratio
+            pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+            # Save the resized image to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_resized:
+                pil_img.save(tmp_resized, format='JPEG', quality=85)
+                resized_path = tmp_resized.name
+        else:
+            resized_path = image_path  # use original if already small
+
+        # Now use OpenCV on the (possibly resized) image
+        img = cv2.imread(resized_path)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         noise_score = min(laplacian_var / 200.0, 1.0)
 
-        pil_img = Image.open(image_path)
-        exif = pil_img.info.get('exif')
+        # Re-open with PIL to get EXIF and dimensions (using original or resized)
+        analysis_img = Image.open(resized_path)
+        exif = analysis_img.info.get('exif')
         exif_present = exif is not None
 
-        stats = os.stat(image_path)
+        stats = os.stat(resized_path)
         file_size_kb = stats.st_size / 1024.0
-        width, height = pil_img.size
+        width, height = analysis_img.size
         pixels = width * height
         compression_ratio = file_size_kb / (pixels / 1000.0) if pixels > 0 else 0
+
+        # Clean up temporary file if we created one
+        if resized_path != image_path:
+            os.unlink(resized_path)
 
         ai_prob = (
             (1.0 - noise_score) * 0.5 +
@@ -116,7 +137,7 @@ def forensic_analysis(image_path: str) -> dict:
             "noise_variance": float(laplacian_var),
             "exif_present": exif_present,
             "compression_ratio": float(compression_ratio),
-            "details": "Forensic heuristics"
+            "details": "Forensic heuristics (resized if needed)"
         }
     except Exception as e:
         return {"ai_probability": 0.5, "details": f"Error: {str(e)}"}
