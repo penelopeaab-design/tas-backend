@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 import logging
+import shutil  # <-- added for cross‑platform tool location
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,28 +38,37 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Detector: C2PA provenance using c2patool
+# Detector: C2PA provenance using c2patool (cross‑platform)
 # ---------------------------
 def check_c2pa(file_path: str) -> dict:
     """
     Uses c2patool (official C2PA tool) to verify provenance.
-    Assumes c2patool.exe is in the same folder or in PATH.
+    Works on Windows and Linux.
     """
+    # Find c2patool in PATH or current directory
+    c2pa_tool = shutil.which("c2patool")
+    if not c2pa_tool:
+        # On Windows, also try with .exe
+        if os.name == 'nt':
+            c2pa_tool = shutil.which("c2patool.exe")
+    if not c2pa_tool:
+        # Look in current directory as fallback
+        local_path = os.path.join(os.path.dirname(__file__), "c2patool")
+        if os.name == 'nt':
+            local_path += ".exe"
+        if os.path.exists(local_path):
+            c2pa_tool = local_path
+        else:
+            return {"present": False, "details": "c2patool not found - please install it"}
+
     try:
-        # Try to run c2patool (look in current directory first)
-        c2pa_tool = os.path.join(os.path.dirname(__file__), "c2patool.exe")
-        if not os.path.exists(c2pa_tool):
-            # Fall back to PATH
-            c2pa_tool = "c2patool"
-        
         result = subprocess.run(
             [c2pa_tool, file_path, '--output', '-'],
             capture_output=True, text=True, timeout=10
         )
-        
+
         if result.returncode == 0 and result.stdout:
             data = json.loads(result.stdout)
-            # Check if there's an active manifest
             active_manifest = data.get('active_manifest')
             if active_manifest:
                 return {
@@ -66,11 +76,7 @@ def check_c2pa(file_path: str) -> dict:
                     "details": "C2PA signature found",
                     "manifest": active_manifest
                 }
-        
         return {"present": False, "details": "No C2PA data"}
-        
-    except FileNotFoundError:
-        return {"present": False, "details": "c2patool not found - please install it"}
     except subprocess.TimeoutExpired:
         return {"present": False, "details": "c2patool timed out"}
     except json.JSONDecodeError:
