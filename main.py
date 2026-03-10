@@ -19,6 +19,24 @@ import numpy as np
 import cv2
 
 # ---------------------------
+# Tunable Ensemble Parameters – change these to experiment!
+# ---------------------------
+# Base score when no signals (0 = definitely RAW, 1 = definitely AI)
+NEUTRAL_SCORE = 0.5
+
+# C2PA influences
+C2PA_PRESENT_RAW_SHIFT = -0.4      # strong RAW signal
+C2PA_ABSENT_AI_SHIFT = 0.1         # slight AI bias if no C2PA
+
+# Forensic influence weight (higher = more impact)
+FORENSIC_WEIGHT = 0.8               # try 0.4, 0.6, 0.8, 1.0
+
+# Decision thresholds
+RAW_THRESHOLD = 0.5                 # scores below this become RAW
+AI_THRESHOLD = 0.7                   # scores above this become AI
+# Scores between RAW_THRESHOLD and AI_THRESHOLD become Uncertain
+
+# ---------------------------
 # Logging setup
 # ---------------------------
 logging.basicConfig(level=logging.INFO)
@@ -153,30 +171,39 @@ def forensic_analysis(image_path: str) -> dict:
         return {"ai_probability": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
-# Ensemble
+# Ensemble (now using tunable parameters)
 # ---------------------------
 def ensemble(forensic: dict, c2pa: dict) -> dict:
-    ai_score = 0.5
+    # Start from neutral
+    ai_score = NEUTRAL_SCORE
 
+    # C2PA influence
     if c2pa.get('present', False):
-        ai_score -= 0.4   # strong RAW signal
+        ai_score += C2PA_PRESENT_RAW_SHIFT   # becomes more RAW
     else:
-        ai_score += 0.1   # slight AI bias
+        ai_score += C2PA_ABSENT_AI_SHIFT     # slight AI bias
 
+    # Forensic influence
     forensic_prob = forensic.get('ai_probability', 0.5)
-    ai_score += (forensic_prob - 0.5) * 0.4
+    ai_score += (forensic_prob - NEUTRAL_SCORE) * FORENSIC_WEIGHT
 
+    # Clamp to [0,1]
     ai_score = max(0.0, min(1.0, ai_score))
 
-    if ai_score < 0.3:
+    # Determine verdict using tunable thresholds
+    if ai_score < RAW_THRESHOLD:
         verdict = "RAW"
         confidence = int((1 - ai_score) * 100)
-    elif ai_score > 0.7:
+    elif ai_score > AI_THRESHOLD:
         verdict = "AI"
         confidence = int(ai_score * 100)
     else:
         verdict = "Uncertain"
-        confidence = int((1 - abs(ai_score - 0.5) * 2) * 100)
+        # confidence is based on distance to nearest threshold
+        dist_to_raw = ai_score - RAW_THRESHOLD
+        dist_to_ai = AI_THRESHOLD - ai_score
+        confidence = int((1 - min(dist_to_raw, dist_to_ai) / (AI_THRESHOLD - RAW_THRESHOLD)) * 100)
+        confidence = max(0, min(100, confidence))
 
     return {
         "verdict": verdict,
