@@ -4,3 +4,4 @@ python-multipart
 pillow
 opencv-python-headless
 numpy
+c2pa

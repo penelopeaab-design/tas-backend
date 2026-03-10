@@ -1,13 +1,9 @@
 # main.py
 import os
-import subprocess
-import json
 import asyncio
 import tempfile
 from pathlib import Path
 import logging
-import shutil
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -38,60 +34,39 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Detector: C2PA provenance using c2patool (hardcoded path + permissions)
+# Detector: C2PA provenance using pure‑Python c2pa library
 # ---------------------------
 def check_c2pa(file_path: str) -> dict:
     """
-    Uses c2patool (official C2PA tool) to verify provenance.
-    Hardcoded to look in the script's directory.
+    Uses the pure-Python c2pa library to verify provenance.
+    No external binary required.
     """
-    # Absolute path to c2patool in the same folder as this script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    c2pa_tool = os.path.join(script_dir, "c2patool")
-    
-    # On Windows, add .exe
-    if os.name == 'nt':
-        c2pa_tool += ".exe"
-    
-    # Check if the binary exists
-    if not os.path.exists(c2pa_tool):
-        logger.error(f"c2patool not found at {c2pa_tool}")
-        return {"present": False, "details": "c2patool binary missing"}
-    
-    # Force executable permissions (works on Linux)
     try:
-        if os.name != 'nt':
-            os.chmod(c2pa_tool, 0o755)  # rwxr-xr-x
-            logger.info(f"Set permissions on {c2pa_tool}")
+        from c2pa import Reader
+        
+        # Read the file as bytes
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        
+        # Attempt to read C2PA manifest
+        reader = Reader.from_bytes(data)
+        manifests = reader.get_manifests()
+        
+        if manifests:
+            # At least one manifest found
+            # Return a simplified representation (you can expand this)
+            return {
+                "present": True,
+                "details": "C2PA signature found",
+                "manifest_count": len(manifests)
+            }
+        else:
+            return {"present": False, "details": "No C2PA data"}
+    except ImportError:
+        logger.error("c2pa library not installed")
+        return {"present": False, "details": "c2pa library not installed"}
     except Exception as e:
-        logger.warning(f"Could not chmod {c2pa_tool}: {e}")
-    
-    # Verify it's executable
-    if not os.access(c2pa_tool, os.X_OK):
-        logger.error(f"c2patool at {c2pa_tool} is not executable")
-        return {"present": False, "details": "c2patool not executable"}
-
-    try:
-        result = subprocess.run(
-            [c2pa_tool, file_path, '--output', '-'],
-            capture_output=True, text=True, timeout=10
-        )
-
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout)
-            active_manifest = data.get('active_manifest')
-            if active_manifest:
-                return {
-                    "present": True,
-                    "details": "C2PA signature found",
-                    "manifest": active_manifest
-                }
-        return {"present": False, "details": "No C2PA data"}
-    except subprocess.TimeoutExpired:
-        return {"present": False, "details": "c2patool timed out"}
-    except json.JSONDecodeError:
-        return {"present": False, "details": "Invalid c2patool output"}
-    except Exception as e:
+        logger.exception("C2PA check failed")
         return {"present": False, "details": f"Error: {str(e)}"}
 
 # ---------------------------
@@ -150,6 +125,7 @@ def forensic_analysis(image_path: str) -> dict:
             "details": "Forensic heuristics (resized if needed)"
         }
     except Exception as e:
+        logger.exception("Forensic analysis failed")
         return {"ai_probability": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
