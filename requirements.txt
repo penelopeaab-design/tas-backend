@@ -4,8 +4,3 @@ python-multipart
 pillow
 opencv-python-headless
 numpy
-tensorflow
-tensorflow-hub
-transformers
-torch
-c2pie
