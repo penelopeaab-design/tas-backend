@@ -19,13 +19,13 @@ import numpy as np
 import cv2
 
 # ---------------------------
-# Tunable Ensemble Parameters – change these to experiment!
+# Tunable Ensemble Parameters
 # ---------------------------
 NEUTRAL_SCORE = 0.5
 C2PA_PRESENT_RAW_SHIFT = -0.4
 C2PA_ABSENT_AI_SHIFT = 0.1
-FORENSIC_WEIGHT = 0.5          # weight for forensic (noise+exif+compression)
-ELA_WEIGHT = 0.5                # weight for Error Level Analysis (new!)
+FORENSIC_WEIGHT = 0.5
+ELA_WEIGHT = 0.5
 RAW_THRESHOLD = 0.3
 AI_THRESHOLD = 0.7
 
@@ -52,9 +52,6 @@ app.add_middleware(
 # Detector: C2PA provenance using c2patool (copied to temp dir)
 # ---------------------------
 def check_c2pa(file_path: str) -> dict:
-    """
-    Uses c2patool binary copied to a temporary location to avoid permission issues.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     src_tool = os.path.join(script_dir, "c2patool")
     if os.name == 'nt':
@@ -100,7 +97,7 @@ def check_c2pa(file_path: str) -> dict:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 # ---------------------------
-# Detector: Forensic heuristics (noise, EXIF, compression)
+# Detector: Forensic heuristics (noise, EXIF, compression) with resizing
 # ---------------------------
 def forensic_analysis(image_path: str) -> dict:
     try:
@@ -151,50 +148,61 @@ def forensic_analysis(image_path: str) -> dict:
         return {"ai_probability": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
-# NEW Detector: Error Level Analysis (ELA)
+# Detector: Error Level Analysis (ELA) with resizing and error handling
 # ---------------------------
 def error_level_analysis(image_path: str) -> dict:
-    """
-    Performs Error Level Analysis to detect compression inconsistencies.
-    Returns a probability (0-1) that the image is AI-generated (higher = more suspicious).
-    """
     try:
         # Open the image
-        original = Image.open(image_path).convert('RGB')
-        # Save as JPEG at quality 90
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-            original.save(tmp.name, 'JPEG', quality=90)
-            temp_jpeg = tmp.name
+        pil_img = Image.open(image_path).convert('RGB')
+        
+        # Resize if too large (same max_dim as forensic)
+        max_dim = 1024
+        if max(pil_img.size) > max_dim:
+            pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+            # Save resized to temp file (to avoid modifying original)
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_resized:
+                pil_img.save(tmp_resized, format='JPEG', quality=85)
+                resized_path = tmp_resized.name
+        else:
+            resized_path = image_path
+
+        # Save as JPEG at quality 90 for ELA comparison
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_jpeg:
+            pil_img.save(tmp_jpeg.name, 'JPEG', quality=90)
+            temp_jpeg = tmp_jpeg.name
 
         # Re-open the resaved image
-        resaved = Image.open(temp_jpeg)
+        resaved = Image.open(temp_jpeg).convert('RGB')
 
         # Compute absolute difference between original and resaved
-        diff = np.abs(np.array(original, dtype=np.int16) - np.array(resaved, dtype=np.int16))
-        # Scale difference to 0-255 and convert to grayscale
-        diff = np.mean(diff, axis=2)  # average over RGB
-        diff = (diff * 255 / diff.max()).astype(np.uint8) if diff.max() > 0 else diff.astype(np.uint8)
+        original_np = np.array(pil_img, dtype=np.int16)
+        resaved_np = np.array(resaved, dtype=np.int16)
+        diff = np.abs(original_np - resaved_np)
+        diff_gray = np.mean(diff, axis=2)
 
-        # Analyze the difference image: high variance or unusual patterns may indicate tampering
-        # For simplicity, we'll use the mean and standard deviation of the difference
-        mean_diff = np.mean(diff)
-        std_diff = np.std(diff)
+        if diff_gray.max() > 0:
+            diff_gray = (diff_gray * 255 / diff_gray.max()).astype(np.uint8)
+        else:
+            diff_gray = diff_gray.astype(np.uint8)
 
-        # Heuristic: AI-generated images often have low mean_diff and high std_diff? 
-        # We'll compute a simple score between 0 and 1
-        # This is a placeholder – you can calibrate with real data
+        mean_diff = np.mean(diff_gray)
+        std_diff = np.std(diff_gray)
+
+        # Simple score formula
         score = min(1.0, (mean_diff / 50.0) + (std_diff / 50.0))
         score = max(0.0, min(1.0, score))
 
-        # Clean up
+        # Clean up temp files
         os.unlink(temp_jpeg)
+        if resized_path != image_path:
+            os.unlink(resized_path)
 
         return {
             "ela_score": float(score),
-            "details": "Error Level Analysis"
+            "details": "Error Level Analysis (resized if needed)"
         }
     except Exception as e:
-        logger.exception("ELA failed")
+        logger.exception("ELA failed for this image")
         return {"ela_score": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
@@ -203,23 +211,19 @@ def error_level_analysis(image_path: str) -> dict:
 def ensemble(forensic: dict, ela: dict, c2pa: dict) -> dict:
     ai_score = NEUTRAL_SCORE
 
-    # C2PA influence
     if c2pa.get('present', False):
         ai_score += C2PA_PRESENT_RAW_SHIFT
     else:
         ai_score += C2PA_ABSENT_AI_SHIFT
 
-    # Forensic influence
     forensic_prob = forensic.get('ai_probability', 0.5)
     ai_score += (forensic_prob - NEUTRAL_SCORE) * FORENSIC_WEIGHT
 
-    # ELA influence
     ela_score = ela.get('ela_score', 0.5)
     ai_score += (ela_score - NEUTRAL_SCORE) * ELA_WEIGHT
 
     ai_score = max(0.0, min(1.0, ai_score))
 
-    # Determine verdict using tunable thresholds
     if ai_score < RAW_THRESHOLD:
         verdict = "RAW"
         confidence = int((1 - ai_score) * 100)
@@ -258,7 +262,6 @@ async def detect(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        # Run detectors in parallel
         c2pa_result = await asyncio.to_thread(check_c2pa, tmp_path)
         forensic_result = await asyncio.to_thread(forensic_analysis, tmp_path)
         ela_result = await asyncio.to_thread(error_level_analysis, tmp_path)
