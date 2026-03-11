@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 import logging
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -36,6 +36,7 @@ JPEGGHOST_WEIGHT = 0.5
 CFA_WEIGHT = 0.5
 LIGHTING_WEIGHT = 0.5
 NOISE_INCONSISTENCY_WEIGHT = 0.5
+GRRE_WEIGHT = 0.5          # premium detector weight
 
 RAW_THRESHOLD = 0.3
 AI_THRESHOLD = 0.7
@@ -272,16 +273,11 @@ def metadata_analysis(image_path: str) -> dict:
         return {"metadata_score": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
-# FIXED DETECTORS
+# Fixed detectors
 # ---------------------------
 
 def copy_move_analysis(image_path: str) -> dict:
-    """
-    Detects duplicated regions using SIFT feature matching.
-    Resizes large images to prevent memory issues.
-    """
     try:
-        # Read and resize if needed
         img = cv2.imread(image_path)
         h, w = img.shape[:2]
         max_dim = 1024
@@ -290,29 +286,22 @@ def copy_move_analysis(image_path: str) -> dict:
             new_w, new_h = int(w * scale), int(h * scale)
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
         sift = cv2.SIFT_create()
         kp, des = sift.detectAndCompute(gray, None)
-
         if des is None or len(kp) < 10:
             return {"copy_move_score": 0.0, "details": "Insufficient features"}
-
         bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         matches = bf.knnMatch(des, des, k=2)
-
         good = []
         for m, n in matches:
             if m.distance < 0.75 * n.distance:
                 if m.queryIdx != m.trainIdx:
                     good.append(m)
-
         if len(good) < 5:
             return {"copy_move_score": 0.0, "details": "No copy-move detected"}
-
         area = gray.shape[0] * gray.shape[1]
         raw_score = len(good) / (area * 1e-5)
         score = min(1.0, raw_score)
-
         return {
             "copy_move_score": float(score),
             "matches_found": len(good),
@@ -435,11 +424,42 @@ def noise_inconsistency_analysis(image_path: str) -> dict:
         return {"noise_inconsistency_score": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
+# NEW Premium Detector: GRRE
+# ---------------------------
+def grre_analysis(image_path: str) -> dict:
+    """
+    G-Channel Removal Reconstruction Error.
+    Removes green channel, reconstructs it, and measures error.
+    Higher score = more likely AI.
+    """
+    try:
+        img = cv2.imread(image_path)
+        b, g, r = cv2.split(img)
+        # Remove green channel (set to zero)
+        b_zero = b.astype(np.float32)
+        r_zero = r.astype(np.float32)
+        # Simple interpolation: average of blue and red
+        g_reconstructed = (b_zero + r_zero) / 2
+        g_original = g.astype(np.float32)
+        # Compute error metrics
+        mse = np.mean((g_original - g_reconstructed) ** 2)
+        # Normalise (typical MSE range may be 0-10000, adjust)
+        score = min(1.0, mse / 5000.0)
+        return {
+            "grre_score": float(score),
+            "mse": float(mse),
+            "details": "G-Channel removal reconstruction error"
+        }
+    except Exception as e:
+        logger.exception("GRRE analysis failed")
+        return {"grre_score": 0.5, "details": f"Error: {str(e)}"}
+
+# ---------------------------
 # Ensemble (all detectors)
 # ---------------------------
 def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
              copymove: dict, jpegghost: dict, cfa: dict, lighting: dict, noise: dict,
-             c2pa: dict) -> dict:
+             grre: dict, c2pa: dict) -> dict:
     ai_score = NEUTRAL_SCORE
 
     if c2pa.get('present', False):
@@ -465,6 +485,7 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
     ai_score += (cfa.get('cfa_score', 0.5) - NEUTRAL_SCORE) * CFA_WEIGHT
     ai_score += (lighting.get('lighting_score', 0.5) - NEUTRAL_SCORE) * LIGHTING_WEIGHT
     ai_score += (noise.get('noise_inconsistency_score', 0.5) - NEUTRAL_SCORE) * NOISE_INCONSISTENCY_WEIGHT
+    ai_score += (grre.get('grre_score', 0.5) - NEUTRAL_SCORE) * GRRE_WEIGHT
 
     ai_score = max(0.0, min(1.0, ai_score))
 
@@ -495,15 +516,19 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
             "jpeg_ghost": jpegghost,
             "cfa": cfa,
             "lighting": lighting,
-            "noise_inconsistency": noise
+            "noise_inconsistency": noise,
+            "grre": grre
         }
     }
 
 # ---------------------------
-# API Endpoint
+# API Endpoint with timeout and premium flag
 # ---------------------------
 @app.post("/detect")
-async def detect(file: UploadFile = File(...)):
+async def detect(
+    file: UploadFile = File(...),
+    premium: bool = Query(False, description="Enable premium detectors")
+):
     if not file.content_type.startswith('image/'):
         raise HTTPException(400, "Only image files are supported")
 
@@ -514,24 +539,57 @@ async def detect(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        c2pa_result = await asyncio.to_thread(check_c2pa, tmp_path)
-        forensic_result = await asyncio.to_thread(forensic_analysis, tmp_path)
-        ela_result = await asyncio.to_thread(error_level_analysis, tmp_path)
-        freq_result = await asyncio.to_thread(frequency_analysis, tmp_path)
-        color_result = await asyncio.to_thread(color_entropy_analysis, tmp_path)
-        meta_result = await asyncio.to_thread(metadata_analysis, tmp_path)
-        copymove_result = await asyncio.to_thread(copy_move_analysis, tmp_path)
-        jpegghost_result = await asyncio.to_thread(jpeg_ghost_analysis, tmp_path)
-        cfa_result = await asyncio.to_thread(cfa_analysis, tmp_path)
-        lighting_result = await asyncio.to_thread(lighting_consistency_analysis, tmp_path)
-        noise_result = await asyncio.to_thread(noise_inconsistency_analysis, tmp_path)
+        # Create tasks for all detectors
+        c2pa_task = asyncio.create_task(asyncio.to_thread(check_c2pa, tmp_path))
+        forensic_task = asyncio.create_task(asyncio.to_thread(forensic_analysis, tmp_path))
+        ela_task = asyncio.create_task(asyncio.to_thread(error_level_analysis, tmp_path))
+        freq_task = asyncio.create_task(asyncio.to_thread(frequency_analysis, tmp_path))
+        color_task = asyncio.create_task(asyncio.to_thread(color_entropy_analysis, tmp_path))
+        meta_task = asyncio.create_task(asyncio.to_thread(metadata_analysis, tmp_path))
+        copymove_task = asyncio.create_task(asyncio.to_thread(copy_move_analysis, tmp_path))
+        jpegghost_task = asyncio.create_task(asyncio.to_thread(jpeg_ghost_analysis, tmp_path))
+        cfa_task = asyncio.create_task(asyncio.to_thread(cfa_analysis, tmp_path))
+        lighting_task = asyncio.create_task(asyncio.to_thread(lighting_consistency_analysis, tmp_path))
+        noise_task = asyncio.create_task(asyncio.to_thread(noise_inconsistency_analysis, tmp_path))
+        
+        tasks = [
+            c2pa_task, forensic_task, ela_task, freq_task, color_task,
+            meta_task, copymove_task, jpegghost_task, cfa_task,
+            lighting_task, noise_task
+        ]
+
+        # Conditionally add premium detector
+        if premium:
+            grre_task = asyncio.create_task(asyncio.to_thread(grre_analysis, tmp_path))
+            tasks.append(grre_task)
+        else:
+            # Provide a placeholder result
+            grre_result = {"grre_score": 0.5, "details": "Premium feature disabled"}
+
+        # Wait for all tasks with a timeout (30 seconds)
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=30
+        )
+
+        # Unpack results
+        (c2pa_result, forensic_result, ela_result, freq_result, color_result,
+         meta_result, copymove_result, jpegghost_result, cfa_result,
+         lighting_result, noise_result) = results[:11]
+
+        if premium:
+            grre_result = results[11]  # the last task result
+        # else grre_result already set
 
         final = ensemble(
             forensic_result, ela_result, freq_result, color_result, meta_result,
             copymove_result, jpegghost_result, cfa_result, lighting_result, noise_result,
-            c2pa_result
+            grre_result, c2pa_result
         )
         return JSONResponse(content=final)
+    except asyncio.TimeoutError:
+        logger.error("Detection timed out")
+        return JSONResponse(status_code=504, content={"error": "Detection timed out"})
     finally:
         os.unlink(tmp_path)
 
