@@ -1,5 +1,6 @@
 # main.py
 import os
+import re
 import subprocess
 import json
 import asyncio
@@ -7,36 +8,58 @@ import tempfile
 import shutil
 from pathlib import Path
 import logging
+import filetype
+import piexif
+from xml.etree import ElementTree as ET
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Image processing
 from PIL import Image
 import numpy as np
 import cv2
 
+# Ensure SIFT is available (requires opencv-contrib-python)
+try:
+    sift = cv2.SIFT_create()
+except AttributeError:
+    raise ImportError("OpenCV contrib modules not found. Please install opencv-contrib-python.")
+
 # ---------------------------
-# Tunable Ensemble Parameters
+# Tunable Ensemble Parameters – normalized sum = 1.0
 # ---------------------------
 NEUTRAL_SCORE = 0.5
-C2PA_PRESENT_RAW_SHIFT = -0.4
-C2PA_ABSENT_AI_SHIFT = 0.1
+C2PA_PRESENT_RAW_SHIFT = -0.4   # strong RAW signal (outside normalized weights)
+C2PA_ABSENT_AI_SHIFT = 0.1      # slight AI bias
 
-FORENSIC_WEIGHT = 0.5
-ELA_WEIGHT = 1.0
-FREQ_WEIGHT = 0.5
-COLOR_WEIGHT = 0.2
-META_WEIGHT = 0.5
+FORENSIC_WEIGHT = 0.05
+ELA_WEIGHT = 0.10
+FREQ_WEIGHT = 0.03
+COLOR_WEIGHT = 0.08
+META_WEIGHT = 0.20               # metadata is a strong signal but strippable; watch in practice
+COPYMOVE_WEIGHT = 0.05
+JPEGGHOST_WEIGHT = 0.05
+CFA_WEIGHT = 0.03
+LIGHTING_WEIGHT = 0.02
+NOISE_INCONSISTENCY_WEIGHT = 0.02
+GRRE_WEIGHT = 0.12
+COLOR_CORR_WEIGHT = 0.10
+SHARPNESS_WEIGHT = 0.10
+XMP_WEIGHT = 0.05
 
-COPYMOVE_WEIGHT = 0.5
-JPEGGHOST_WEIGHT = 0.5
-CFA_WEIGHT = 0.5
-LIGHTING_WEIGHT = 0.5
-NOISE_INCONSISTENCY_WEIGHT = 0.5
-GRRE_WEIGHT = 0.5          # premium detector weight
+_total = sum([FORENSIC_WEIGHT, ELA_WEIGHT, FREQ_WEIGHT, COLOR_WEIGHT, META_WEIGHT,
+              COPYMOVE_WEIGHT, JPEGGHOST_WEIGHT, CFA_WEIGHT, LIGHTING_WEIGHT,
+              NOISE_INCONSISTENCY_WEIGHT, GRRE_WEIGHT, COLOR_CORR_WEIGHT,
+              SHARPNESS_WEIGHT, XMP_WEIGHT])
+assert abs(_total - 1.0) < 0.001, f"Weights must sum to 1.0, got {_total}"
 
 RAW_THRESHOLD = 0.3
 AI_THRESHOLD = 0.7
@@ -48,9 +71,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# FastAPI app with CORS
+# FastAPI app with CORS and rate limiting
 # ---------------------------
 app = FastAPI(title="TAS Detection API")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,23 +88,37 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Existing detectors (unchanged)
+# Constants
 # ---------------------------
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+C2PA_TOOL_PATH = os.environ.get("C2PA_TOOL_PATH", os.path.join(os.path.dirname(__file__), "c2patool"))
+if os.name == 'nt':
+    C2PA_TOOL_PATH += ".exe"
 
+# ---------------------------
+# Helper: validate image file using magic bytes
+# ---------------------------
+def validate_image(file_bytes: bytes) -> bool:
+    kind = filetype.guess(file_bytes)
+    if kind is None:
+        return False
+    return kind.mime.startswith('image/')
+
+# ---------------------------
+# Detector: C2PA provenance using c2patool
+# ---------------------------
 def check_c2pa(file_path: str) -> dict:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    src_tool = os.path.join(script_dir, "c2patool")
-    if os.name == 'nt':
-        src_tool += ".exe"
-    if not os.path.exists(src_tool):
-        logger.error(f"c2patool not found at {src_tool}")
+    if not os.path.exists(C2PA_TOOL_PATH):
+        logger.error(f"c2patool not found at {C2PA_TOOL_PATH}")
         return {"present": False, "details": "c2patool binary missing"}
+
     temp_dir = tempfile.mkdtemp()
     dest_tool = os.path.join(temp_dir, "c2patool")
     if os.name == 'nt':
         dest_tool += ".exe"
+
     try:
-        shutil.copy2(src_tool, dest_tool)
+        shutil.copy2(C2PA_TOOL_PATH, dest_tool)
         os.chmod(dest_tool, 0o755)
         logger.info(f"Copied c2patool to {dest_tool} and set permissions")
         result = subprocess.run(
@@ -104,6 +145,9 @@ def check_c2pa(file_path: str) -> dict:
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+# ---------------------------
+# Detector: Forensic heuristics (noise, EXIF, compression)
+# ---------------------------
 def forensic_analysis(image_path: str) -> dict:
     try:
         pil_img = Image.open(image_path)
@@ -116,10 +160,12 @@ def forensic_analysis(image_path: str) -> dict:
             pil_img.close()
         else:
             resized_path = image_path
+
         img = cv2.imread(resized_path)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         noise_score = min(laplacian_var / 200.0, 1.0)
+
         analysis_img = Image.open(resized_path)
         exif = analysis_img.info.get('exif')
         exif_present = exif is not None
@@ -129,14 +175,17 @@ def forensic_analysis(image_path: str) -> dict:
         pixels = width * height
         compression_ratio = file_size_kb / (pixels / 1000.0) if pixels > 0 else 0
         analysis_img.close()
+
         if resized_path != image_path:
             os.unlink(resized_path)
+
         ai_prob = (
             (1.0 - noise_score) * 0.5 +
             (0.3 if not exif_present else 0.0) +
             (0.2 if compression_ratio < 0.1 else 0.0)
         )
         ai_prob = min(ai_prob, 1.0)
+
         return {
             "ai_probability": ai_prob,
             "noise_variance": float(laplacian_var),
@@ -159,27 +208,34 @@ def error_level_analysis(image_path: str) -> dict:
                 resized_path = tmp_resized.name
         else:
             resized_path = image_path
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_jpeg:
             pil_img.save(tmp_jpeg.name, 'JPEG', quality=90)
             temp_jpeg = tmp_jpeg.name
+
         resaved = Image.open(temp_jpeg).convert('RGB')
         original_np = np.array(pil_img, dtype=np.int16)
         resaved_np = np.array(resaved, dtype=np.int16)
         diff = np.abs(original_np - resaved_np)
         diff_gray = np.mean(diff, axis=2)
+
         if diff_gray.max() > 0:
             diff_gray = (diff_gray * 255 / diff_gray.max()).astype(np.uint8)
         else:
             diff_gray = diff_gray.astype(np.uint8)
+
         mean_diff = np.mean(diff_gray)
         std_diff = np.std(diff_gray)
         score = min(1.0, (mean_diff / 50.0) + (std_diff / 50.0))
         score = max(0.0, min(1.0, score))
+
         os.unlink(temp_jpeg)
         if resized_path != image_path:
             os.unlink(resized_path)
+
         pil_img.close()
         resaved.close()
+
         return {
             "ela_score": float(score),
             "details": "Error Level Analysis (resized if needed)"
@@ -196,18 +252,22 @@ def frequency_analysis(image_path: str) -> dict:
             pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         img = np.array(pil_img, dtype=np.float32)
         pil_img.close()
+
         fft = np.fft.fft2(img)
         fft_shift = np.fft.fftshift(fft)
         magnitude = np.abs(fft_shift)
+
         rows, cols = img.shape
         crow, ccol = rows // 2, cols // 2
         radius = int(min(rows, cols) * 0.1)
         mask = np.ones((rows, cols), dtype=bool)
         mask[crow-radius:crow+radius, ccol-radius:ccol+radius] = False
+
         total_energy = np.sum(magnitude**2)
         high_energy = np.sum(magnitude[mask]**2)
         ratio = high_energy / total_energy if total_energy > 0 else 0.5
         score = min(1.0, ratio * 2.0)
+
         return {
             "fft_score": float(score),
             "details": "Frequency analysis (FFT)"
@@ -245,36 +305,79 @@ def color_entropy_analysis(image_path: str) -> dict:
 
 def metadata_analysis(image_path: str) -> dict:
     try:
-        img = Image.open(image_path)
-        exif = img._getexif()
         score = 0.5
-        if exif:
-            has_camera = (271 in exif) or (272 in exif)
-            if has_camera:
-                score -= 0.3
-            if 305 in exif:
-                software = str(exif[305]).lower()
-                ai_keywords = ['ai', 'generator', 'midjourney', 'dalle', 'stable diffusion']
-                if any(k in software for k in ai_keywords):
-                    score += 0.4
-            elif not has_camera:
-                score -= 0.1
-        else:
+        has_exif = False
+        has_camera_info = False
+        software = None
+
+        try:
+            exif_dict = piexif.load(image_path)
+            if exif_dict:
+                has_exif = True
+                ifd_0 = exif_dict.get('0th', {})
+                if ifd_0.get(piexif.ImageIFD.Make) or ifd_0.get(piexif.ImageIFD.Model):
+                    has_camera_info = True
+                    score -= 0.3
+                software = ifd_0.get(piexif.ImageIFD.Software)
+                if software and isinstance(software, bytes):
+                    software = software.decode('utf-8', errors='ignore').lower()
+                    ai_keywords = ['ai', 'generator', 'midjourney', 'dalle', 'stable diffusion']
+                    if any(k in software for k in ai_keywords):
+                        score += 0.4
+        except Exception:
+            pass
+
+        if not has_exif:
             score += 0.2
+        elif not has_camera_info:
+            score -= 0.1
+
         score = max(0.0, min(1.0, score))
+
         return {
             "metadata_score": float(score),
-            "has_exif": exif is not None,
-            "has_camera_info": (exif and (271 in exif or 272 in exif)) if exif else False,
-            "details": "Metadata analysis"
+            "has_exif": has_exif,
+            "has_camera_info": has_camera_info,
+            "software": software,
+            "details": "Metadata analysis (EXIF + XMP)"
         }
     except Exception as e:
         logger.exception("Metadata analysis failed")
         return {"metadata_score": 0.5, "details": f"Error: {str(e)}"}
 
-# ---------------------------
-# Fixed detectors
-# ---------------------------
+def xmp_analysis(image_path: str) -> dict:
+    try:
+        with open(image_path, 'rb') as f:
+            data = f.read()
+        xmp_start = data.find(b'<x:xmpmeta')
+        if xmp_start == -1:
+            return {"xmp_score": 0.0, "details": "No XMP found"}
+
+        chunk = data[xmp_start:xmp_start+65536]
+        try:
+            chunk_str = chunk.decode('utf-8', errors='ignore')
+        except:
+            return {"xmp_score": 0.5, "details": "XMP decoding error"}
+
+        score = 0.0
+        if 'dc:creator' in chunk_str:
+            score += 0.3
+        if 'photoshop:Source' in chunk_str:
+            score += 0.3
+        m = re.search(r'xmp:CreatorTool="([^"]+)"', chunk_str)
+        if m:
+            tool = m.group(1).lower()
+            ai_keywords = ['midjourney', 'dalle', 'stable diffusion', 'firefly']
+            if any(k in tool for k in ai_keywords):
+                score += 0.4
+        score = min(1.0, score)
+        return {
+            "xmp_score": float(score),
+            "details": "XMP metadata analysis"
+        }
+    except Exception as e:
+        logger.exception("XMP analysis failed")
+        return {"xmp_score": 0.5, "details": f"Error: {str(e)}"}
 
 def copy_move_analysis(image_path: str) -> dict:
     try:
@@ -286,7 +389,6 @@ def copy_move_analysis(image_path: str) -> dict:
             new_w, new_h = int(w * scale), int(h * scale)
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        sift = cv2.SIFT_create()
         kp, des = sift.detectAndCompute(gray, None)
         if des is None or len(kp) < 10:
             return {"copy_move_score": 0.0, "details": "Insufficient features"}
@@ -312,10 +414,6 @@ def copy_move_analysis(image_path: str) -> dict:
         return {"copy_move_score": 0.5, "details": f"Error: {str(e)}"}
 
 def jpeg_ghost_analysis(image_path: str) -> dict:
-    """
-    Detects multiple JPEG compressions by analyzing differences at various qualities.
-    Properly cleans up temp files.
-    """
     try:
         pil_img = Image.open(image_path).convert('RGB')
         max_dim = 1024
@@ -323,20 +421,23 @@ def jpeg_ghost_analysis(image_path: str) -> dict:
             pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
         qualities = [95, 85, 75, 65]
-        diff_std = []
-        prev_img = None
         temp_files = []
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_orig:
+            pil_img.save(tmp_orig.name, 'JPEG', quality=100)
+            orig_path = tmp_orig.name
+            temp_files.append(orig_path)
+            orig_img = cv2.imread(orig_path, cv2.IMREAD_GRAYSCALE)
 
+        max_diff = 0.0
         for q in qualities:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
                 pil_img.save(tmp.name, 'JPEG', quality=q)
                 temp_files.append(tmp.name)
-                tmp_img = cv2.imread(tmp.name, cv2.IMREAD_GRAYSCALE)
-
-            if prev_img is not None:
-                diff = cv2.absdiff(prev_img, tmp_img)
-                diff_std.append(np.std(diff))
-            prev_img = tmp_img
+                q_img = cv2.imread(tmp.name, cv2.IMREAD_GRAYSCALE)
+            diff = cv2.absdiff(orig_img, q_img)
+            diff_std = np.std(diff)
+            if diff_std > max_diff:
+                max_diff = diff_std
 
         for f in temp_files:
             try:
@@ -345,16 +446,10 @@ def jpeg_ghost_analysis(image_path: str) -> dict:
                 logger.warning(f"Could not delete temp file {f}: {e}")
 
         pil_img.close()
-
-        if len(diff_std) < 2:
-            return {"jpeg_ghost_score": 0.5, "details": "Insufficient data"}
-
-        ghost_strength = np.std(diff_std) / 10.0
-        score = min(1.0, ghost_strength)
+        score = min(1.0, max_diff / 30.0)
         return {
             "jpeg_ghost_score": float(score),
-            "diff_std": diff_std,
-            "details": "JPEG ghost analysis"
+            "details": "JPEG ghost analysis (robust)"
         }
     except Exception as e:
         logger.exception("JPEG ghost analysis failed")
@@ -423,27 +518,15 @@ def noise_inconsistency_analysis(image_path: str) -> dict:
         logger.exception("Noise inconsistency analysis failed")
         return {"noise_inconsistency_score": 0.5, "details": f"Error: {str(e)}"}
 
-# ---------------------------
-# NEW Premium Detector: GRRE
-# ---------------------------
 def grre_analysis(image_path: str) -> dict:
-    """
-    G-Channel Removal Reconstruction Error.
-    Removes green channel, reconstructs it, and measures error.
-    Higher score = more likely AI.
-    """
     try:
         img = cv2.imread(image_path)
         b, g, r = cv2.split(img)
-        # Remove green channel (set to zero)
         b_zero = b.astype(np.float32)
         r_zero = r.astype(np.float32)
-        # Simple interpolation: average of blue and red
         g_reconstructed = (b_zero + r_zero) / 2
         g_original = g.astype(np.float32)
-        # Compute error metrics
         mse = np.mean((g_original - g_reconstructed) ** 2)
-        # Normalise (typical MSE range may be 0-10000, adjust)
         score = min(1.0, mse / 5000.0)
         return {
             "grre_score": float(score),
@@ -454,14 +537,90 @@ def grre_analysis(image_path: str) -> dict:
         logger.exception("GRRE analysis failed")
         return {"grre_score": 0.5, "details": f"Error: {str(e)}"}
 
+def color_correlation_analysis(image_path: str) -> dict:
+    try:
+        img = cv2.imread(image_path)
+        h, w, _ = img.shape
+        max_dim = 1024
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
+
+        patch_size = 64
+        correlations = []
+        for y in range(0, h - patch_size, patch_size):
+            for x in range(0, w - patch_size, patch_size):
+                patch = img[y:y+patch_size, x:x+patch_size]
+                b, g, r = cv2.split(patch)
+                b = b.flatten().astype(np.float32)
+                g = g.flatten().astype(np.float32)
+                r = r.flatten().astype(np.float32)
+                corr_rg = np.corrcoef(r, g)[0,1] if np.std(r) > 0 and np.std(g) > 0 else 0
+                corr_rb = np.corrcoef(r, b)[0,1] if np.std(r) > 0 and np.std(b) > 0 else 0
+                corr_gb = np.corrcoef(g, b)[0,1] if np.std(g) > 0 and np.std(b) > 0 else 0
+                avg_corr = (corr_rg + corr_rb + corr_gb) / 3.0
+                correlations.append(avg_corr)
+
+        if not correlations:
+            return {"color_corr_score": 0.5, "details": "Image too small"}
+
+        global_avg = np.mean(correlations)
+        ai_prob = 1.0 - (global_avg + 1) / 2
+        ai_prob = max(0.0, min(1.0, ai_prob))
+        return {
+            "color_corr_score": float(ai_prob),
+            "avg_corr": float(global_avg),
+            "details": "Local color channel correlation"
+        }
+    except Exception as e:
+        logger.exception("Color correlation analysis failed")
+        return {"color_corr_score": 0.5, "details": f"Error: {str(e)}"}
+
+def sharpness_analysis(image_path: str) -> dict:
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        h, w = img.shape
+        max_dim = 1024
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
+
+        block_size = 64
+        sharpness_vals = []
+        for y in range(0, h - block_size, block_size):
+            for x in range(0, w - block_size, block_size):
+                block = img[y:y+block_size, x:x+block_size]
+                lap = cv2.Laplacian(block, cv2.CV_64F)
+                sharpness_vals.append(np.var(lap))
+
+        if len(sharpness_vals) < 2:
+            return {"sharpness_score": 0.5, "details": "Image too small"}
+
+        sharpness_std = np.std(sharpness_vals)
+        uniformity = min(1.0, sharpness_std / 500.0)
+        ai_prob = 1.0 - uniformity
+        return {
+            "sharpness_score": float(ai_prob),
+            "sharpness_std": float(sharpness_std),
+            "details": "Sharpness inconsistency (calibrated)"
+        }
+    except Exception as e:
+        logger.exception("Sharpness analysis failed")
+        return {"sharpness_score": 0.5, "details": f"Error: {str(e)}"}
+
 # ---------------------------
 # Ensemble (all detectors)
 # ---------------------------
-def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
+def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
              copymove: dict, jpegghost: dict, cfa: dict, lighting: dict, noise: dict,
-             grre: dict, c2pa: dict) -> dict:
+             grre: dict, color_corr: dict, sharpness: dict, xmp: dict, c2pa: dict) -> dict:
     ai_score = NEUTRAL_SCORE
 
+    # C2PA is a cryptographic signal; it overrides the weighted ensemble.
     if c2pa.get('present', False):
         ai_score += C2PA_PRESENT_RAW_SHIFT
     else:
@@ -475,8 +634,8 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
     freq_ai = 1 - freq.get('fft_score', 0.5)
     ai_score += (freq_ai - NEUTRAL_SCORE) * FREQ_WEIGHT
 
-    color_ai = 1 - color.get('color_entropy', 0.5)
-    ai_score += (color_ai - NEUTRAL_SCORE) * COLOR_WEIGHT
+    color_ent_ai = 1 - color_ent.get('color_entropy', 0.5)
+    ai_score += (color_ent_ai - NEUTRAL_SCORE) * COLOR_WEIGHT
 
     ai_score += (meta.get('metadata_score', 0.5) - NEUTRAL_SCORE) * META_WEIGHT
 
@@ -486,6 +645,10 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
     ai_score += (lighting.get('lighting_score', 0.5) - NEUTRAL_SCORE) * LIGHTING_WEIGHT
     ai_score += (noise.get('noise_inconsistency_score', 0.5) - NEUTRAL_SCORE) * NOISE_INCONSISTENCY_WEIGHT
     ai_score += (grre.get('grre_score', 0.5) - NEUTRAL_SCORE) * GRRE_WEIGHT
+
+    ai_score += (color_corr.get('color_corr_score', 0.5) - NEUTRAL_SCORE) * COLOR_CORR_WEIGHT
+    ai_score += (sharpness.get('sharpness_score', 0.5) - NEUTRAL_SCORE) * SHARPNESS_WEIGHT
+    ai_score += (xmp.get('xmp_score', 0.5) - NEUTRAL_SCORE) * XMP_WEIGHT
 
     ai_score = max(0.0, min(1.0, ai_score))
 
@@ -510,88 +673,130 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color: dict, meta: dict,
             "forensic": forensic,
             "ela": ela,
             "frequency": freq,
-            "color_entropy": color,
+            "color_entropy": color_ent,
             "metadata": meta,
             "copy_move": copymove,
             "jpeg_ghost": jpegghost,
             "cfa": cfa,
             "lighting": lighting,
             "noise_inconsistency": noise,
-            "grre": grre
+            "grre": grre,
+            "color_correlation": color_corr,
+            "sharpness": sharpness,
+            "xmp": xmp
         }
     }
 
 # ---------------------------
-# API Endpoint with timeout and premium flag
+# Version endpoint
+# ---------------------------
+@app.get("/version")
+async def version():
+    return {
+        "detectors": [
+            "c2pa", "forensic", "ela", "frequency", "color_entropy",
+            "metadata", "copy_move", "jpeg_ghost", "cfa", "lighting",
+            "noise_inconsistency", "grre", "color_correlation",
+            "sharpness", "xmp"
+        ],
+        "weights": {
+            "forensic": FORENSIC_WEIGHT,
+            "ela": ELA_WEIGHT,
+            "frequency": FREQ_WEIGHT,
+            "color_entropy": COLOR_WEIGHT,
+            "metadata": META_WEIGHT,
+            "copy_move": COPYMOVE_WEIGHT,
+            "jpeg_ghost": JPEGGHOST_WEIGHT,
+            "cfa": CFA_WEIGHT,
+            "lighting": LIGHTING_WEIGHT,
+            "noise_inconsistency": NOISE_INCONSISTENCY_WEIGHT,
+            "grre": GRRE_WEIGHT,
+            "color_correlation": COLOR_CORR_WEIGHT,
+            "sharpness": SHARPNESS_WEIGHT,
+            "xmp": XMP_WEIGHT
+        },
+        "thresholds": {
+            "raw": RAW_THRESHOLD,
+            "ai": AI_THRESHOLD
+        },
+        "c2pa_shifts": {
+            "present": C2PA_PRESENT_RAW_SHIFT,
+            "absent": C2PA_ABSENT_AI_SHIFT
+        }
+    }
+
+# ---------------------------
+# API Endpoint with file size limit, validation, and rate limiting
 # ---------------------------
 @app.post("/detect")
+@limiter.limit("10/minute")
 async def detect(
+    request: Request,
     file: UploadFile = File(...),
-    premium: bool = Query(False, description="Enable premium detectors")
+    premium: bool = Query(True, description="All detectors are always enabled")
 ):
     if not file.content_type.startswith('image/'):
         raise HTTPException(400, "Only image files are supported")
 
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
+
+    if not validate_image(content):
+        raise HTTPException(400, "Uploaded file is not a valid image (magic bytes mismatch)")
+
     suffix = Path(file.filename).suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        # Create tasks for all detectors
+        # Run all detectors in parallel
         c2pa_task = asyncio.create_task(asyncio.to_thread(check_c2pa, tmp_path))
         forensic_task = asyncio.create_task(asyncio.to_thread(forensic_analysis, tmp_path))
         ela_task = asyncio.create_task(asyncio.to_thread(error_level_analysis, tmp_path))
         freq_task = asyncio.create_task(asyncio.to_thread(frequency_analysis, tmp_path))
-        color_task = asyncio.create_task(asyncio.to_thread(color_entropy_analysis, tmp_path))
+        color_ent_task = asyncio.create_task(asyncio.to_thread(color_entropy_analysis, tmp_path))
         meta_task = asyncio.create_task(asyncio.to_thread(metadata_analysis, tmp_path))
         copymove_task = asyncio.create_task(asyncio.to_thread(copy_move_analysis, tmp_path))
         jpegghost_task = asyncio.create_task(asyncio.to_thread(jpeg_ghost_analysis, tmp_path))
         cfa_task = asyncio.create_task(asyncio.to_thread(cfa_analysis, tmp_path))
         lighting_task = asyncio.create_task(asyncio.to_thread(lighting_consistency_analysis, tmp_path))
         noise_task = asyncio.create_task(asyncio.to_thread(noise_inconsistency_analysis, tmp_path))
-        
+        grre_task = asyncio.create_task(asyncio.to_thread(grre_analysis, tmp_path))
+        color_corr_task = asyncio.create_task(asyncio.to_thread(color_correlation_analysis, tmp_path))
+        sharpness_task = asyncio.create_task(asyncio.to_thread(sharpness_analysis, tmp_path))
+        xmp_task = asyncio.create_task(asyncio.to_thread(xmp_analysis, tmp_path))
+
         tasks = [
-            c2pa_task, forensic_task, ela_task, freq_task, color_task,
+            c2pa_task, forensic_task, ela_task, freq_task, color_ent_task,
             meta_task, copymove_task, jpegghost_task, cfa_task,
-            lighting_task, noise_task
+            lighting_task, noise_task, grre_task, color_corr_task,
+            sharpness_task, xmp_task
         ]
 
-        # Conditionally add premium detector
-        if premium:
-            grre_task = asyncio.create_task(asyncio.to_thread(grre_analysis, tmp_path))
-            tasks.append(grre_task)
-        else:
-            # Provide a placeholder result
-            grre_result = {"grre_score": 0.5, "details": "Premium feature disabled"}
-
-        # Wait for all tasks with a timeout (30 seconds)
         results = await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True),
             timeout=30
         )
 
-        # Unpack results
-        (c2pa_result, forensic_result, ela_result, freq_result, color_result,
+        (c2pa_result, forensic_result, ela_result, freq_result, color_ent_result,
          meta_result, copymove_result, jpegghost_result, cfa_result,
-         lighting_result, noise_result) = results[:11]
-
-        if premium:
-            grre_result = results[11]  # the last task result
-        # else grre_result already set
+         lighting_result, noise_result, grre_result,
+         color_corr_result, sharpness_result, xmp_result) = results
 
         final = ensemble(
-            forensic_result, ela_result, freq_result, color_result, meta_result,
+            forensic_result, ela_result, freq_result, color_ent_result, meta_result,
             copymove_result, jpegghost_result, cfa_result, lighting_result, noise_result,
-            grre_result, c2pa_result
+            grre_result, color_corr_result, sharpness_result, xmp_result, c2pa_result
         )
         return JSONResponse(content=final)
     except asyncio.TimeoutError:
         logger.error("Detection timed out")
         return JSONResponse(status_code=504, content={"error": "Detection timed out"})
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 @app.get("/health")
 async def health():
