@@ -37,32 +37,34 @@ except AttributeError:
 # Tunable Ensemble Parameters – normalized sum = 1.0
 # ---------------------------
 NEUTRAL_SCORE = 0.5
-C2PA_PRESENT_RAW_SHIFT = -0.4   # strong RAW signal (outside normalized weights)
-C2PA_ABSENT_AI_SHIFT = 0.1      # slight AI bias
+C2PA_PRESENT_RAW_SHIFT = -0.4
+C2PA_ABSENT_AI_SHIFT = 0.0
 
-FORENSIC_WEIGHT = 0.05
-ELA_WEIGHT = 0.10
-FREQ_WEIGHT = 0.03
-COLOR_WEIGHT = 0.08
-META_WEIGHT = 0.20               # metadata is a strong signal but strippable; watch in practice
+FORENSIC_WEIGHT = 0.04
+ELA_WEIGHT = 0.05
+FREQ_WEIGHT = 0.01
+COLOR_WEIGHT = 0.07
+META_WEIGHT = 0.15
 COPYMOVE_WEIGHT = 0.05
 JPEGGHOST_WEIGHT = 0.05
-CFA_WEIGHT = 0.03
+CFA_WEIGHT = 0.02
 LIGHTING_WEIGHT = 0.02
 NOISE_INCONSISTENCY_WEIGHT = 0.02
-GRRE_WEIGHT = 0.12
+GRRE_WEIGHT = 0.17
 COLOR_CORR_WEIGHT = 0.10
 SHARPNESS_WEIGHT = 0.10
 XMP_WEIGHT = 0.05
+EXIF_COMPLETENESS_WEIGHT = 0.05
+SENSOR_NOISE_WEIGHT = 0.05
 
 _total = sum([FORENSIC_WEIGHT, ELA_WEIGHT, FREQ_WEIGHT, COLOR_WEIGHT, META_WEIGHT,
               COPYMOVE_WEIGHT, JPEGGHOST_WEIGHT, CFA_WEIGHT, LIGHTING_WEIGHT,
               NOISE_INCONSISTENCY_WEIGHT, GRRE_WEIGHT, COLOR_CORR_WEIGHT,
-              SHARPNESS_WEIGHT, XMP_WEIGHT])
+              SHARPNESS_WEIGHT, XMP_WEIGHT, EXIF_COMPLETENESS_WEIGHT, SENSOR_NOISE_WEIGHT])
 assert abs(_total - 1.0) < 0.001, f"Weights must sum to 1.0, got {_total}"
 
-RAW_THRESHOLD = 0.3
-AI_THRESHOLD = 0.7
+RAW_THRESHOLD = 0.35
+AI_THRESHOLD = 0.65
 
 # ---------------------------
 # Logging setup
@@ -613,14 +615,64 @@ def sharpness_analysis(image_path: str) -> dict:
         return {"sharpness_score": 0.5, "details": f"Error: {str(e)}"}
 
 # ---------------------------
+# NEW: EXIF completeness detector
+# ---------------------------
+def exif_completeness_analysis(image_path: str) -> dict:
+    try:
+        exif_dict = piexif.load(image_path)
+        total_fields = 0
+        for ifd_name, ifd_data in exif_dict.items():
+            if isinstance(ifd_data, dict):
+                total_fields += len(ifd_data)
+        ai_prob = max(0.0, 1.0 - min(1.0, total_fields / 20.0))
+        return {
+            "exif_completeness_score": float(ai_prob),
+            "field_count": total_fields,
+            "details": "EXIF completeness"
+        }
+    except Exception as e:
+        logger.exception("EXIF completeness analysis failed")
+        return {"exif_completeness_score": 0.5, "details": f"Error: {str(e)}"}
+
+# ---------------------------
+# NEW: Sensor noise pattern detector (PRNU-lite) – corrected inversion
+# ---------------------------
+def sensor_noise_analysis(image_path: str) -> dict:
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+        denoised = cv2.GaussianBlur(img, (5, 5), 0)
+        residual = img - denoised
+        h, w = residual.shape
+        q1 = residual[0:h//2, 0:w//2]
+        q2 = residual[0:h//2, w//2:w]
+        q3 = residual[h//2:h, 0:w//2]
+        q4 = residual[h//2:h, w//2:w]
+        variances = [np.var(q) for q in [q1, q2, q3, q4]]
+        mean_var = np.mean(variances)
+        if mean_var < 1e-6:
+            return {"sensor_noise_score": 0.5, "details": "Uniform region"}
+        consistency = np.std(variances) / mean_var
+        # Low consistency (more uniform) likely AI, high consistency (structured) likely real.
+        # So we set ai_prob = consistency (low consistency → low ai_prob)
+        ai_prob = max(0.0, min(1.0, consistency))
+        return {
+            "sensor_noise_score": float(ai_prob),
+            "consistency": float(consistency),
+            "details": "Sensor noise pattern (PRNU-lite)"
+        }
+    except Exception as e:
+        logger.exception("Sensor noise analysis failed")
+        return {"sensor_noise_score": 0.5, "details": f"Error: {str(e)}"}
+
+# ---------------------------
 # Ensemble (all detectors)
 # ---------------------------
 def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
              copymove: dict, jpegghost: dict, cfa: dict, lighting: dict, noise: dict,
-             grre: dict, color_corr: dict, sharpness: dict, xmp: dict, c2pa: dict) -> dict:
+             grre: dict, color_corr: dict, sharpness: dict, xmp: dict,
+             exif_comp: dict, sensor_noise: dict, c2pa: dict) -> dict:
     ai_score = NEUTRAL_SCORE
 
-    # C2PA is a cryptographic signal; it overrides the weighted ensemble.
     if c2pa.get('present', False):
         ai_score += C2PA_PRESENT_RAW_SHIFT
     else:
@@ -649,6 +701,9 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
     ai_score += (color_corr.get('color_corr_score', 0.5) - NEUTRAL_SCORE) * COLOR_CORR_WEIGHT
     ai_score += (sharpness.get('sharpness_score', 0.5) - NEUTRAL_SCORE) * SHARPNESS_WEIGHT
     ai_score += (xmp.get('xmp_score', 0.5) - NEUTRAL_SCORE) * XMP_WEIGHT
+
+    ai_score += (exif_comp.get('exif_completeness_score', 0.5) - NEUTRAL_SCORE) * EXIF_COMPLETENESS_WEIGHT
+    ai_score += (sensor_noise.get('sensor_noise_score', 0.5) - NEUTRAL_SCORE) * SENSOR_NOISE_WEIGHT
 
     ai_score = max(0.0, min(1.0, ai_score))
 
@@ -683,7 +738,9 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
             "grre": grre,
             "color_correlation": color_corr,
             "sharpness": sharpness,
-            "xmp": xmp
+            "xmp": xmp,
+            "exif_completeness": exif_comp,
+            "sensor_noise": sensor_noise
         }
     }
 
@@ -697,7 +754,7 @@ async def version():
             "c2pa", "forensic", "ela", "frequency", "color_entropy",
             "metadata", "copy_move", "jpeg_ghost", "cfa", "lighting",
             "noise_inconsistency", "grre", "color_correlation",
-            "sharpness", "xmp"
+            "sharpness", "xmp", "exif_completeness", "sensor_noise"
         ],
         "weights": {
             "forensic": FORENSIC_WEIGHT,
@@ -713,7 +770,9 @@ async def version():
             "grre": GRRE_WEIGHT,
             "color_correlation": COLOR_CORR_WEIGHT,
             "sharpness": SHARPNESS_WEIGHT,
-            "xmp": XMP_WEIGHT
+            "xmp": XMP_WEIGHT,
+            "exif_completeness": EXIF_COMPLETENESS_WEIGHT,
+            "sensor_noise": SENSOR_NOISE_WEIGHT
         },
         "thresholds": {
             "raw": RAW_THRESHOLD,
@@ -726,7 +785,7 @@ async def version():
     }
 
 # ---------------------------
-# API Endpoint with file size limit, validation, and rate limiting
+# API Endpoint
 # ---------------------------
 @app.post("/detect")
 @limiter.limit("10/minute")
@@ -767,12 +826,14 @@ async def detect(
         color_corr_task = asyncio.create_task(asyncio.to_thread(color_correlation_analysis, tmp_path))
         sharpness_task = asyncio.create_task(asyncio.to_thread(sharpness_analysis, tmp_path))
         xmp_task = asyncio.create_task(asyncio.to_thread(xmp_analysis, tmp_path))
+        exif_comp_task = asyncio.create_task(asyncio.to_thread(exif_completeness_analysis, tmp_path))
+        sensor_noise_task = asyncio.create_task(asyncio.to_thread(sensor_noise_analysis, tmp_path))
 
         tasks = [
             c2pa_task, forensic_task, ela_task, freq_task, color_ent_task,
             meta_task, copymove_task, jpegghost_task, cfa_task,
             lighting_task, noise_task, grre_task, color_corr_task,
-            sharpness_task, xmp_task
+            sharpness_task, xmp_task, exif_comp_task, sensor_noise_task
         ]
 
         results = await asyncio.wait_for(
@@ -783,12 +844,14 @@ async def detect(
         (c2pa_result, forensic_result, ela_result, freq_result, color_ent_result,
          meta_result, copymove_result, jpegghost_result, cfa_result,
          lighting_result, noise_result, grre_result,
-         color_corr_result, sharpness_result, xmp_result) = results
+         color_corr_result, sharpness_result, xmp_result,
+         exif_comp_result, sensor_noise_result) = results
 
         final = ensemble(
             forensic_result, ela_result, freq_result, color_ent_result, meta_result,
             copymove_result, jpegghost_result, cfa_result, lighting_result, noise_result,
-            grre_result, color_corr_result, sharpness_result, xmp_result, c2pa_result
+            grre_result, color_corr_result, sharpness_result, xmp_result,
+            exif_comp_result, sensor_noise_result, c2pa_result
         )
         return JSONResponse(content=final)
     except asyncio.TimeoutError:
