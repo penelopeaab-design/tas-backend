@@ -37,25 +37,25 @@ except AttributeError:
 # Tunable Ensemble Parameters – normalized sum = 1.0
 # ---------------------------
 NEUTRAL_SCORE = 0.5
-C2PA_PRESENT_RAW_SHIFT = -0.4
-C2PA_ABSENT_AI_SHIFT = 0.0
+C2PA_PRESENT_RAW_SHIFT = -0.25   # reduced: C2PA alone shouldn't dominate
+C2PA_ABSENT_AI_SHIFT = 0.05      # mild AI signal: real cameras often embed C2PA/EXIF
 
-FORENSIC_WEIGHT = 0.04
-ELA_WEIGHT = 0.05
-FREQ_WEIGHT = 0.01
-COLOR_WEIGHT = 0.07
-META_WEIGHT = 0.15
-COPYMOVE_WEIGHT = 0.05
-JPEGGHOST_WEIGHT = 0.05
-CFA_WEIGHT = 0.02
-LIGHTING_WEIGHT = 0.02
-NOISE_INCONSISTENCY_WEIGHT = 0.02
-GRRE_WEIGHT = 0.17
-COLOR_CORR_WEIGHT = 0.10
+FORENSIC_WEIGHT = 0.05
+ELA_WEIGHT = 0.06
+FREQ_WEIGHT = 0.08            # boosted: AI images have distinctive frequency fingerprints
+COLOR_WEIGHT = 0.04
+META_WEIGHT = 0.14            # strong: metadata absence is one of the strongest AI signals
+COPYMOVE_WEIGHT = 0.03
+JPEGGHOST_WEIGHT = 0.04
+CFA_WEIGHT = 0.03
+LIGHTING_WEIGHT = 0.03
+NOISE_INCONSISTENCY_WEIGHT = 0.06   # boosted: AI noise is unnaturally uniform
+GRRE_WEIGHT = 0.10            # reduced: unreliable for portrait AI
+COLOR_CORR_WEIGHT = 0.08
 SHARPNESS_WEIGHT = 0.10
 XMP_WEIGHT = 0.05
-EXIF_COMPLETENESS_WEIGHT = 0.05
-SENSOR_NOISE_WEIGHT = 0.05
+EXIF_COMPLETENESS_WEIGHT = 0.07    # boosted: StyleGAN/diffusion images have sparse or no EXIF
+SENSOR_NOISE_WEIGHT = 0.04
 
 _total = sum([FORENSIC_WEIGHT, ELA_WEIGHT, FREQ_WEIGHT, COLOR_WEIGHT, META_WEIGHT,
               COPYMOVE_WEIGHT, JPEGGHOST_WEIGHT, CFA_WEIGHT, LIGHTING_WEIGHT,
@@ -63,8 +63,8 @@ _total = sum([FORENSIC_WEIGHT, ELA_WEIGHT, FREQ_WEIGHT, COLOR_WEIGHT, META_WEIGH
               SHARPNESS_WEIGHT, XMP_WEIGHT, EXIF_COMPLETENESS_WEIGHT, SENSOR_NOISE_WEIGHT])
 assert abs(_total - 1.0) < 0.001, f"Weights must sum to 1.0, got {_total}"
 
-RAW_THRESHOLD = 0.35
-AI_THRESHOLD = 0.65
+RAW_THRESHOLD = 0.40    # raised: need stronger evidence to call something RAW
+AI_THRESHOLD = 0.60     # lowered: AI images shouldn't need to score very high to be caught
 
 # ---------------------------
 # Logging setup
@@ -652,9 +652,9 @@ def sensor_noise_analysis(image_path: str) -> dict:
         if mean_var < 1e-6:
             return {"sensor_noise_score": 0.5, "details": "Uniform region"}
         consistency = np.std(variances) / mean_var
-        # Low consistency (more uniform) likely AI, high consistency (structured) likely real.
-        # So we set ai_prob = consistency (low consistency → low ai_prob)
-        ai_prob = max(0.0, min(1.0, consistency))
+        # High consistency (uniform noise) = AI signal; Low consistency (structured) = real camera
+        # So ai_prob = 1 - consistency (low std/mean = very uniform = AI)
+        ai_prob = max(0.0, min(1.0, 1.0 - consistency))
         return {
             "sensor_noise_score": float(ai_prob),
             "consistency": float(consistency),
@@ -707,6 +707,100 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
 
     ai_score = max(0.0, min(1.0, ai_score))
 
+    # ---------------------------
+    # Hard override — signals chosen from ACTUAL calibration data.
+    #
+    # These four signals show the largest gap between real and AI images
+    # based on observed scores. All are expressed so that 1.0 = strong AI:
+    #
+    #   exif_completeness_score  real≈0.10  AI≈0.90  gap=0.80  ← strongest
+    #   sharpness_score          real≈0.05  AI≈0.55  gap=0.50
+    #   forensic ai_probability  real≈0.30  AI≈0.55  gap=0.25
+    #   metadata_score           real≈0.40  AI≈0.65  gap=0.25
+    #
+    # fft_score, cfa_score, lighting_score and noise_inconsistency_score
+    # were all ~0.95-1.00 on BOTH real and AI images — they cannot
+    # discriminate and must NOT be used in the override.
+    # ---------------------------
+    strong_ai_signals = {
+        "exif_completeness": exif_comp.get("exif_completeness_score", 0.5),
+        "sharpness":         sharpness.get("sharpness_score", 0.5),
+        "forensic":          forensic.get("ai_probability", 0.5),
+        "metadata":          meta.get("metadata_score", 0.5),
+    }
+    # Thresholds calibrated from observed real vs AI scores:
+    #   exif_completeness > 0.45  (real camera ≈ 0.05-0.15, AI ≈ 0.50-1.00)
+    #   sharpness         > 0.40  (real ≈ 0.00-0.05,        AI ≈ 0.55+ for faces)
+    #   forensic          > 0.28  (real PNG ≈ 0.30 so just below; AI JPEG ≈ 0.55+)
+    #   metadata          > 0.55  (real ≈ 0.40,              AI ≈ 0.65-0.95)
+    thresholds = {
+        "exif_completeness": 0.45,
+        "sharpness":         0.40,
+        "forensic":          0.28,
+        "metadata":          0.55,
+    }
+    strong_ai_count = sum(
+        1 for k, v in strong_ai_signals.items() if v > thresholds[k]
+    )
+    override_triggered = False
+    override_reason = None
+
+    # Path A — 3+ signals agree: standard override
+    if strong_ai_count >= 3:
+        if ai_score < 0.62:
+            ai_score = 0.62
+            override_triggered = True
+            triggered_names = [
+                f"{k}={v:.2f}>{thresholds[k]}"
+                for k, v in strong_ai_signals.items()
+                if v > thresholds[k]
+            ]
+            override_reason = (
+                f"Hard override (3-signal): {strong_ai_count}/4 detectors "
+                f"exceeded thresholds ({', '.join(triggered_names)}). "
+                f"Score floored to 0.62."
+            )
+            logger.info(override_reason)
+
+    # Path B — 2-signal high-confidence bypass:
+    # exif_completeness > 0.85 AND metadata > 0.65 is near-impossible for a
+    # real camera image (cameras write rich EXIF → exif_completeness stays low).
+    # This catches AI-generated PNGs that have partial metadata but no camera EXIF.
+    elif (
+        strong_ai_signals["exif_completeness"] > 0.85
+        and strong_ai_signals["metadata"] > 0.65
+    ):
+        if ai_score < 0.62:
+            ai_score = 0.62
+            override_triggered = True
+            override_reason = (
+                f"Hard override (2-signal bypass): "
+                f"exif_completeness={strong_ai_signals['exif_completeness']:.2f}>0.85 "
+                f"AND metadata={strong_ai_signals['metadata']:.2f}>0.65. "
+                f"Score floored to 0.62."
+            )
+            logger.info(override_reason)
+
+    # Path C — exif + forensic bypass:
+    # Catches images with no camera EXIF (sparse = AI) AND elevated forensic
+    # noise score. Real camera images score forensic ~0.30; AI-generated JPEGs
+    # with compression artefacts score 0.55+. Unsplash real photos have
+    # exif=1.00 but forensic=0.30, so the forensic threshold keeps them safe.
+    elif (
+        strong_ai_signals["exif_completeness"] > 0.85
+        and strong_ai_signals["forensic"] > 0.55
+    ):
+        if ai_score < 0.62:
+            ai_score = 0.62
+            override_triggered = True
+            override_reason = (
+                f"Hard override (exif+forensic bypass): "
+                f"exif_completeness={strong_ai_signals['exif_completeness']:.2f}>0.85 "
+                f"AND forensic={strong_ai_signals['forensic']:.2f}>0.55. "
+                f"Score floored to 0.62."
+            )
+            logger.info(override_reason)
+
     if ai_score < RAW_THRESHOLD:
         verdict = "RAW"
         confidence = int((1 - ai_score) * 100)
@@ -723,6 +817,12 @@ def ensemble(forensic: dict, ela: dict, freq: dict, color_ent: dict, meta: dict,
     return {
         "verdict": verdict,
         "confidence": confidence,
+        "override": {
+            "triggered": override_triggered,
+            "reason": override_reason,
+            "strong_ai_signals": {k: round(v, 3) for k, v in strong_ai_signals.items()},
+            "strong_ai_count": strong_ai_count,
+        },
         "details": {
             "c2pa": c2pa,
             "forensic": forensic,
